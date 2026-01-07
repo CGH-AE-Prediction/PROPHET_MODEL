@@ -96,7 +96,7 @@ def add_f1_events(df):
     return df
 
 
-def train_model(df, years=[2022, 2023, 2024]):
+def train_model(df, years=[2022, 2023, 2024, 2025]):
     """Train Prophet model on specified years."""
     df_train = df[df["ds"].dt.year.isin(years)].dropna(subset=["last_30_avg"])
     
@@ -198,3 +198,4 @@ if __name__ == "__main__":
     
 
     run_forecast(input_file, prediction_date, output_file)
+
