@@ -193,7 +193,8 @@ if __name__ == "__main__":
     # Replace settings here
     # Need to update input file with raw data, make sure format is same as current excel files provided by CGH
     input_file = r"C:\Users\thach\VSCodeProjects\cgh-project-updated\data\edarrivals_20182024.csv"
-    prediction_date = "2025-01-01"  # or None to use latest date
+    prediction_date = "2024-12-31"  # or None to use latest date
     output_file = "predictions.csv"  # or None to skip saving
     
+
     run_forecast(input_file, prediction_date, output_file)
