@@ -1,3 +1,4 @@
+# deployment code (updated with new features)
 # To use, replace file paths / names at IF statement at the very bottom 
 
 import sys
@@ -96,21 +97,189 @@ def add_f1_events(df):
     return df
 
 
+def create_post_rest_spike_feature(df, date_col='ds', year_list=None):
+    """
+    Marks the first working day after 3+ consecutive rest days (weekends + holidays) as 1.
+    """
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    
+    if year_list is None:
+        year_list = df[date_col].dt.year.unique().tolist()
+    
+    sg_holidays = make_holidays_df(year_list=year_list, country='SG')
+    holiday_dates = set(pd.to_datetime(sg_holidays['ds']).dt.date)
+    
+    min_date = df[date_col].min() - pd.Timedelta(days=10)
+    max_date = df[date_col].max() + pd.Timedelta(days=10)
+    all_dates = pd.date_range(start=min_date, end=max_date, freq='D')
+    
+    helper_df = pd.DataFrame({'date': all_dates})
+    helper_df['is_weekend'] = helper_df['date'].dt.dayofweek.isin([5, 6])
+    helper_df['is_holiday'] = helper_df['date'].dt.date.isin(holiday_dates)
+    helper_df['is_rest_day'] = helper_df['is_weekend'] | helper_df['is_holiday']
+    helper_df['rest_group'] = (~helper_df['is_rest_day']).cumsum()
+    
+    spike_dates = []
+    for group_id, group_df in helper_df[helper_df['is_rest_day']].groupby('rest_group'):
+        if len(group_df) >= 3:
+            last_rest_day = group_df['date'].max()
+            next_day = last_rest_day + pd.Timedelta(days=1)
+            next_day_info = helper_df[helper_df['date'] == next_day]
+            if len(next_day_info) > 0 and not next_day_info['is_rest_day'].values[0]:
+                spike_dates.append(next_day)
+    
+    df['post_rest_spike'] = df[date_col].isin(set(spike_dates)).astype(int)
+    return df
+
+
+def create_post_holiday_features(df, date_col='ds', year_list=None):
+    """
+    Creates binary columns marking the next working day after specific holidays:
+    - after_cny: Next working day after Chinese New Year
+    - after_christmas: Next working day after Christmas Day
+    - after_ny: Next working day after New Year's Day
+    - after_ramadan: Next working day after Eid al-Fitr
+    """
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    
+    if year_list is None:
+        year_list = df[date_col].dt.year.unique().tolist()
+    
+    # Get Singapore holidays
+    sg_holidays = make_holidays_df(year_list=year_list, country='SG')
+    sg_holidays['ds'] = pd.to_datetime(sg_holidays['ds'])
+    
+    # Create set of all holiday dates for checking working days
+    all_holiday_dates = set(sg_holidays['ds'].dt.date)
+    
+    def get_next_working_day(holiday_date, all_holiday_dates):
+        """Find the next working day after a holiday (not weekend, not holiday)"""
+        next_day = holiday_date + pd.Timedelta(days=1)
+        # Keep advancing until we find a working day
+        while True:
+            is_weekend = next_day.dayofweek in [5, 6]  # Saturday=5, Sunday=6
+            is_holiday = next_day.date() in all_holiday_dates
+            if not is_weekend and not is_holiday:
+                return next_day
+            next_day += pd.Timedelta(days=1)
+    
+    # Define holiday patterns to match
+    holiday_patterns = {
+        'after_cny': ['Chinese New Year', 'Chinese New Year (observed)'],
+        'after_christmas': ['Christmas Day', 'Christmas Day (observed)'],
+        'after_ny': ["New Year's Day", "New Year's Day (observed)"],
+        'after_ramadan': ['Eid al-Fitr', 'Eid al-Fitr (observed)']
+    }
+    
+    # Find post-holiday dates for each category
+    post_holiday_dates = {key: set() for key in holiday_patterns.keys()}
+    
+    for feature_name, patterns in holiday_patterns.items():
+        # Get all dates for this holiday type
+        holiday_dates = sg_holidays[sg_holidays['holiday'].isin(patterns)]['ds'].tolist()
+        
+        # For holidays that span multiple days (like CNY), find the last day
+        # Group consecutive dates
+        if holiday_dates:
+            holiday_dates_sorted = sorted(holiday_dates)
+            
+            # Group consecutive holiday dates
+            groups = []
+            current_group = [holiday_dates_sorted[0]]
+            
+            for i in range(1, len(holiday_dates_sorted)):
+                # Check if this date is consecutive to the previous one
+                if (holiday_dates_sorted[i] - holiday_dates_sorted[i-1]).days <= 1:
+                    current_group.append(holiday_dates_sorted[i])
+                else:
+                    groups.append(current_group)
+                    current_group = [holiday_dates_sorted[i]]
+            groups.append(current_group)
+            
+            # For each group, find the next working day after the last date
+            for group in groups:
+                last_holiday_date = max(group)
+                next_working = get_next_working_day(last_holiday_date, all_holiday_dates)
+                post_holiday_dates[feature_name].add(next_working)
+    
+    # Create binary columns
+    for feature_name, dates in post_holiday_dates.items():
+        df[feature_name] = df[date_col].isin(dates).astype(int)
+    
+    return df
+
+
+def add_all_features(df, year_list=None):
+    """Add all features: F1 events, post-rest spike, and post-holiday features."""
+    if year_list is None:
+        year_list = df['ds'].dt.year.unique().tolist()
+    
+    # Add F1 events
+    df = add_f1_events(df)
+    
+    # Add post-rest spike feature
+    df = create_post_rest_spike_feature(df, date_col='ds', year_list=year_list)
+    
+    # Add post-holiday features
+    df = create_post_holiday_features(df, date_col='ds', year_list=year_list)
+    
+    return df
+
+
 def train_model(df, years=[2022, 2023, 2024, 2025]):
-    """Train Prophet model on specified years."""
+    """Train Prophet model on specified years with all regressors."""
     df_train = df[df["ds"].dt.year.isin(years)].dropna(subset=["last_30_avg"])
     
     holidays = make_holidays_df(year_list=years, country="SG")
-    holidays["lower_window"] = -3
+    holidays["lower_window"] = 0
     holidays["upper_window"] = 0
     
     model = Prophet(holidays=holidays, seasonality_mode="multiplicative")
     model.add_regressor("covid_cases")
     model.add_regressor("f1_event")
     model.add_regressor("last_30_avg")
+    model.add_regressor("post_rest_spike")
+    model.add_regressor("after_cny")
+    model.add_regressor("after_christmas")
+    model.add_regressor("after_ny")
+    model.add_regressor("after_ramadan")
     model.fit(df_train)
     
     return model
+
+
+def prepare_future_features(df_future, df_historical, prediction_date, year_list):
+    """Prepare all feature values for future dates."""
+    prediction_date = pd.to_datetime(prediction_date)
+    
+    # COVID cases (assume 0 for future)
+    df_future["covid_cases"] = 0
+    
+    # Last 30 day average from historical data
+    df_future["last_30_avg"] = df_historical[df_historical["ds"] <= prediction_date]["y"].tail(30).mean()
+    
+    # F1 events
+    f1_dates = get_f1_dates(year_list)
+    df_future["f1_event"] = df_future["ds"].isin(f1_dates).astype(int)
+    
+    # Apply F1 lag effects (4 days before, 2 days after)
+    for idx, row in df_future.iterrows():
+        if row["f1_event"] == 0:
+            for f1_date in f1_dates:
+                diff = (row["ds"] - f1_date).days
+                if -4 <= diff <= 2:
+                    df_future.loc[idx, "f1_event"] = 1
+                    break
+    
+    # Post-rest spike feature
+    df_future = create_post_rest_spike_feature(df_future, date_col='ds', year_list=year_list)
+    
+    # Post-holiday features
+    df_future = create_post_holiday_features(df_future, date_col='ds', year_list=year_list)
+    
+    return df_future
 
 
 def predict(model, df, prediction_date):
@@ -120,22 +289,12 @@ def predict(model, df, prediction_date):
     
     # Build future dataframe
     df_future = pd.DataFrame({"ds": future_dates})
-    df_future["covid_cases"] = 0
-    df_future["last_30_avg"] = df[df["ds"] <= prediction_date]["y"].tail(30).mean()
     
-    # Add F1 indicator
-    years = list(set([d.year for d in future_dates] + [2022, 2023, 2024, 2025, 2026]))
-    f1_dates = get_f1_dates(years)
-    df_future["f1_event"] = df_future["ds"].isin(f1_dates).astype(int)
+    # Determine year list for feature generation
+    year_list = list(set([d.year for d in future_dates] + [2022, 2023, 2024, 2025, 2026]))
     
-    # Apply F1 lag effects
-    for idx, row in df_future.iterrows():
-        if row["f1_event"] == 0:
-            for f1_date in f1_dates:
-                diff = (row["ds"] - f1_date).days
-                if -4 <= diff <= 2:
-                    df_future.loc[idx, "f1_event"] = 1
-                    break
+    # Prepare all features
+    df_future = prepare_future_features(df_future, df, prediction_date, year_list)
     
     # Predict
     forecast = model.predict(df_future)
@@ -159,7 +318,10 @@ def run_forecast(input_file, prediction_date=None, output_file=None):
     
     print("Preprocessing...")
     df = preprocess(df_raw)
-    df = add_f1_events(df)
+    
+    print("Adding features (F1, post-rest spike, post-holiday)...")
+    year_list = [2022, 2023, 2024, 2025, 2026]
+    df = add_all_features(df, year_list=year_list)
     
     print("Training model...")
     model = train_model(df)
@@ -192,12 +354,8 @@ if __name__ == "__main__":
 
     # Replace settings here
     # Need to update input file with raw data, make sure format is same as current excel files provided by CGH
-    # Need to update the input file daily for best results
     input_file = r"C:\Users\thach\VSCodeProjects\cgh-project-updated\data\edarrivals_20182024.csv"
     prediction_date = "2024-12-31"  # or None to use latest date
     output_file = "predictions.csv"  # or None to skip saving
     
-
     run_forecast(input_file, prediction_date, output_file)
-
-
